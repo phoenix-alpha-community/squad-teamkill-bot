@@ -1,47 +1,48 @@
+#!/usr/bin/env python3
+
+import aiohttp
 import asyncio
 import config
-import jsonpickle
+import discord
 import logging
 import msvcrt
+import ntpath
 import os
 import re
 import sys
 import traceback
-import urllib3
 import win32file
 from datetime import datetime
-from hbmqtt.client import MQTTClient, ClientException
-from hbmqtt.mqtt.constants import QOS_0, QOS_1, QOS_2
+from discord import Webhook, AsyncWebhookAdapter
+from logging.handlers import RotatingFileHandler
 from pytz import timezone
+from steam import SteamQuery
 from teamkill import TeamKill
-from tzlocal import get_localzone
 
-
-def _get_file_id(filename):
-    #return os.fstat(f.fileno()).st_ino # FILE_INDEX on Windows. Not unique?
-    # Use creation time instead (should suffice to notice file replacement)
-    return os.path.getctime(filename)
 
 class TKMonitor():
 
-    def __init__(self, host, qport, basedir):
+    def __init__(self, basedir):
         self.basedir = basedir
         self.log_filename = basedir + r"\SquadGame\Saved\Logs\SquadGame.log"
         self.admincam_log_filename = basedir + r"\SquadGame\Saved\Logs\admincam.log"
         self.recent_damages = []
         self.seen_tks = set()
         self.last_log_id = 0
-        self.server_host = host
-        self.server_qport = qport
         self.active_admin_cam_users = set()
+
+        basename = ntpath.basename(basedir)
 
         # logger
         LOG_LEVEL = logging.DEBUG
-        LOG_FILE = f"debug-{qport}.log"
+        LOG_FILE = f"debug-{basename}.log"
 
-        logger = logging.getLogger(f"tkm-{qport}")
+        logger = logging.getLogger(f"tkm-{basename}")
         logger.setLevel(LOG_LEVEL)
-        file_handler = logging.FileHandler(LOG_FILE, encoding="UTF-8")
+        file_handler = RotatingFileHandler(LOG_FILE, mode='a',
+                                           maxBytes=1*1024*1024*1024, # 1GB
+                                           encoding="UTF-8", delay=0,
+                                           backupCount=2)
         file_handler.setLevel(LOG_LEVEL)
         logger.addHandler(file_handler)
         self.logger = logger
@@ -51,16 +52,16 @@ class TKMonitor():
         self.logger.debug("[FILE] (Re-)Opening server log file...")
         # source:
         # https://www.thepythoncorner.com/2016/10/python-how-to-open-a-file-on-windows-without-locking-it/
-        # get an handle using win32 API, specifying the SHARED access!
+        # get a handle using win32 API, specifying the SHARED access!
         handle = win32file.CreateFile(self.log_filename,
-                                        win32file.GENERIC_READ,
-                                        win32file.FILE_SHARE_DELETE |
-                                        win32file.FILE_SHARE_READ |
-                                        win32file.FILE_SHARE_WRITE,
-                                        None,
-                                        win32file.OPEN_EXISTING,
-                                        0,
-                                        None)
+                                      win32file.GENERIC_READ,
+                                      win32file.FILE_SHARE_DELETE |
+                                      win32file.FILE_SHARE_READ |
+                                      win32file.FILE_SHARE_WRITE,
+                                      None,
+                                      win32file.OPEN_EXISTING,
+                                      0,
+                                      None)
         # detach the handle
         detached_handle = handle.Detach()
         # get a file descriptor associated to the handle
@@ -198,8 +199,7 @@ class TKMonitor():
                 victim = dmg.group("victim")
                 killer = dmg.group("killer")
                 weapon = dmg.group("weapon")
-                tk = TeamKill(time_utc, victim, killer, weapon,
-                              self.server_host, self.server_qport)
+                tk = TeamKill(time_utc, victim, killer, weapon)
 
                 # remember log ID of last TK to avoid duplicates
                 self.seen_tks.add(team_kill.group("log_id"))
@@ -267,10 +267,9 @@ class TKMonitor():
         time_naive = datetime.strptime(time_str, "%Y.%m.%d-%H.%M.%S:%f")
         # Timestamps are UTC
         time_utc = timezone("UTC").localize(time_naive)
-        time_est = time_utc.astimezone(config.TIMEZONE)
-        time_str_est = time_est.strftime("%Y.%m.%d - %H:%M:%S")
+        time_utc_str = time_utc.strftime("%Y.%m.%d - %H:%M:%S")
         user = match.group("user")
-        log_message = f"[{time_str_est} EST] {change}: {user}"
+        log_message = f"[{time_str_utc} UTC] {change}: {user}"
 
         self.logger.debug(f"[ADMIN_CAM] Opening admincam log")
         with open(self.admincam_log_filename, "a", encoding="UTF-8") as f:
@@ -278,7 +277,7 @@ class TKMonitor():
             f.write(log_message + "\n")
             self.logger.debug(f"[ADMIN_CAM] Done writing to admincam log")
         self.logger.debug(f"[ADMIN_CAM] Closed admincam log")
-        print(f"[ADMIN CAM][{self.server_qport}]{log_message}")
+        print(f"[ADMIN CAM][{self.basedir}]{log_message}")
 
         return True
 
@@ -294,56 +293,77 @@ class TKMonitor():
             self.logger.debug(f"[FOLLOW] TK-")
 
 
-async def send_mqtt(payload):
-    '''Publishes the payload on the configured topic.'''
-    logging.info(f"[MQTT_SEND] START")
-    mqtt_config = {
-        'auto_reconnect': True,
-        'reconnect_max_interval': 10,
-        'reconnect_retries': 10,
-    }
-    mqtt_client = MQTTClient(config=mqtt_config)
-
-    user = config.MQTT_PUB_USER
-    password = config.MQTT_PUB_PASSWORD
-    host, port = config.MQTT_ADDRESS
-    url = f"mqtt://{user}:{password}@{host}:{port}/"
-    logging.info(f"[MQTT_SEND] CONNECT_START")
-    await mqtt_client.connect(url)
-    logging.info(f"[MQTT_SEND] MQTT_SENDING")
-    await mqtt_client.publish(config.MQTT_TOPIC, payload, qos=QOS_2)
-    logging.info(f"[MQTT_SEND] DISCONNECTING")
-    await mqtt_client.disconnect()
-    logging.info(f"[MQTT_SEND] DONE")
-
-
-async def run_tkm(host, qport, basedir):
-    tkm = TKMonitor(host, qport, basedir)
+async def run_tkm(server):
+    tkm = TKMonitor(server.basedir)
     logging.debug("Creating TKMs")
     async for tk in tkm.tk_follow():
-        payload = jsonpickle.dumps(tk).encode("UTF-8")
-        logging.info(f"[SEND] {tk}")
+        logging.info(f"[SEND] {server} {tk}")
 
         try:
-            await send_mqtt(payload)
-        except e:
-            sys.stderr.write("[ERROR] [{qport}] Exception in send_mqtt\n")
-            traceback.print_exc(e)
+            await post_tk(server, tk)
+        except Exception as e:
+            sys.stderr.write("[ERROR] [{qport}] Exception in post_tk\n")
+            traceback.print_exception(type(e), e, e.__traceback__)
             sys.stderr.write("[ERROR] [{qport}] <<< End of exception\n")
+
+
+async def post_tk(server, teamkill):
+    '''Posts the Teamkill to Discord via the configured webhooks.
+
+    Current map and servername are obtained through SteamQuery.'''
+
+    # Get map and name from SteamQuery
+    server_obj  = SteamQuery(server.host, server.qport)
+    server_info = server_obj.query_game_server()
+    cur_map     = server_info["map"]
+    server_name = server_info["name"]
+
+    # Create embed
+    embed = discord.Embed(title=f"TK on {server_name}")
+
+    # Time
+    time_utc = teamkill.time_utc
+    time_config = time_utc.astimezone(config.TIMEZONE)
+    time_config_str = time_config.strftime("%m/%d/%Y %H:%M:%S")
+    embed.add_field(name=f"Date / Time ({config.TIMEZONE_NAME})",
+                    value=time_config_str, inline=True)
+
+    # Time (UTC)
+    time_utc_str = time_utc.strftime("%H:%M:%S")
+    if time_utc.date() > time_config.date():
+        time_utc_str += " (+1 day)"
+    embed.add_field(name='Time (UTC)', value=time_utc_str, inline=True)
+
+    embed.add_field(name='Map', value=cur_map, inline=True)
+
+    # Killer
+    embed.add_field(name='Killer', value=teamkill.killer, inline=True)
+    # Victim
+    embed.add_field(name='Victim', value=teamkill.victim, inline=True)
+    # Weapon
+    embed.add_field(name='Weapon', value=teamkill.weapon, inline=True)
+
+    # Send message via webhook
+    async with aiohttp.ClientSession() as session:
+        webhook = Webhook.from_url(server.webhook_url,
+                                   adapter=AsyncWebhookAdapter(session))
+        await webhook.send(embed=embed)
 
 
 async def main():
     tasks = []
     for server in config.servers:
-        tasks.append(asyncio.create_task(
-            run_tkm(server.host, server.qport, server.base_dir)))
+        tasks.append(asyncio.create_task(run_tkm(server)))
 
     for t in tasks:
         await t
 
 
 if __name__ == "__main__":
-    file_handler = logging.FileHandler("main.log", encoding="UTF-8")
+    file_handler = RotatingFileHandler("main.log", mode='a',
+                                        maxBytes=1*1024*1024*1024, # 1GB
+                                        encoding="UTF-8", delay=0,
+                                        backupCount=2)
     file_handler.setLevel(logging.DEBUG)
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(logging.INFO)
