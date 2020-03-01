@@ -269,7 +269,7 @@ class TKMonitor():
         time_utc = timezone("UTC").localize(time_naive)
         time_utc_str = time_utc.strftime("%Y.%m.%d - %H:%M:%S")
         user = match.group("user")
-        log_message = f"[{time_str_utc} UTC] {change}: {user}"
+        log_message = f"[{time_utc_str} UTC] {change}: {user}"
 
         self.logger.debug(f"[ADMIN_CAM] Opening admincam log")
         with open(self.admincam_log_filename, "a", encoding="UTF-8") as f:
