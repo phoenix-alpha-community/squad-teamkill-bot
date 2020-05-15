@@ -2,7 +2,6 @@
 
 import aiohttp
 import asyncio
-import config
 import discord
 import logging
 import msvcrt
@@ -12,15 +11,15 @@ import re
 import sys
 import traceback
 import win32file
+from . import config
+from .teamkill import TeamKill
 from datetime import datetime
 from discord import Webhook, AsyncWebhookAdapter
-from logging.handlers import RotatingFileHandler
 from pytz import timezone
 from steam import SteamQuery
-from teamkill import TeamKill
 
 
-class TKMonitor():
+class TKMonitor:
 
     def __init__(self, basedir):
         self.basedir = basedir
@@ -33,23 +32,10 @@ class TKMonitor():
 
         basename = ntpath.basename(basedir)
 
-        # logger
-        LOG_LEVEL = logging.DEBUG
-        LOG_FILE = f"debug-{basename}.log"
-
-        logger = logging.getLogger(f"tkm-{basename}")
-        logger.setLevel(LOG_LEVEL)
-        file_handler = RotatingFileHandler(LOG_FILE, mode='a',
-                                           maxBytes=1*1024*1024*1024, # 1GB
-                                           encoding="UTF-8", delay=0,
-                                           backupCount=2)
-        file_handler.setLevel(LOG_LEVEL)
-        logger.addHandler(file_handler)
-        self.logger = logger
-
+        self.logger = logging.getLogger(f"{__name__}_{basename}")
 
     def _open_log_file(self):
-        self.logger.debug("[FILE] (Re-)Opening server log file...")
+        self.logger.debug("(Re-)Opening server log file...")
         # source:
         # https://www.thepythoncorner.com/2016/10/python-how-to-open-a-file-on-windows-without-locking-it/
         # get a handle using win32 API, specifying the SHARED access!
@@ -74,13 +60,13 @@ class TKMonitor():
 
         size = os.fstat(f.fileno()).st_size
 
-        self.logger.debug(f"[FILE] Opened server log file. Size: {size}")
-        return (f, size)
+        self.logger.debug(f"Opened server log file. Size: {size}")
+        return f, size
 
-    ## Generate the lines in the text file as they are created
+    # Generate the lines in the text file as they are created
     async def _log_follow(self):
         f, file_size = self._open_log_file()
-        linecounter = 0
+        line_counter = 0
         # read indefinitely
         while True:
             # read until end of file
@@ -88,36 +74,38 @@ class TKMonitor():
                 try:
                     line = f.readline()
                 except UnicodeDecodeError as e:
-                    sys.stderr.write("[WARN] Skipped line because of decode error\n")
+                    sys.stderr.write(
+                        "[WARN] Skipped line because of decode error\n")
                     line = "DECODE_ERROR"
-                    self.logger.debug(f"[LINE_READ] DECODE_ERROR")
+                    self.logger.debug(f"DECODE_ERROR")
                 if not line:
                     break
                 # update file size every 1000 lines
-                if linecounter == 0:
+                if line_counter == 0:
                     file_size = os.fstat(f.fileno()).st_size
-                linecounter = (linecounter + 1) % 1000
-                self.logger.debug(f"[LINE_READ][READ]{line}")
+                line_counter = (line_counter + 1) % 1000
+                self.logger.debug(f"[READ]{line}")
                 yield line
             try:
                 # check if file has been truncated
                 cur_size = os.fstat(f.fileno()).st_size
-                self.logger.debug(f"[LINE_READ] [FILE_SIZE] {cur_size} -- {file_size}")
+                self.logger.debug(
+                    f"[FILE_SIZE] {cur_size} -- {file_size}")
                 if cur_size < file_size:
-                    self.logger.debug(f"[LINE_READ] FILE_TRUNCATED")
+                    self.logger.debug(f"FILE_TRUNCATED")
                     # close and re-open
                     f.close()
                     f, file_size = self._open_log_file()
             except IOError as e:
-                self.logger.warn(f"[LINE_READ] [EXCEPTION] {e}")
-            self.logger.debug(f"[LINE_READ] GOING_TO_SLEEP")
+                self.logger.warning(f"[EXCEPTION] {e}")
+            self.logger.debug(f"GOING_TO_SLEEP")
             await asyncio.sleep(1)
-            self.logger.debug(f"[LINE_READ] WOKE_UP")
+            self.logger.debug(f"WOKE_UP")
 
-    ## Parser to find teamkills, map, kill info
+    # Parser to find teamkills, map, kill info
     def parse_line(self, line):
-        '''Returns TK object if TK occurred, `None` otherwise.'''
-        self.logger.debug(f"[PARSE] START")
+        """Returns TK object if TK occurred, `None` otherwise."""
+        self.logger.debug(f"START")
 
         # try matching to admin cam usage format
         if self._match_admincam(line):
@@ -131,69 +119,70 @@ class TKMonitor():
         return self._match_teamkill(line)
 
     def _match_damage(self, line):
-        '''Returns `True` if line was a damage notification,
-        `False` otherwise.'''
-        self.logger.debug(f"[DAMAGE] ?")
+        """Returns `True` if line was a damage notification,
+        `False` otherwise."""
+        self.logger.debug(f"?")
 
         actual_damage = re.search(
-            r"\[(?P<time>[^\]]+)\]" # time
-            r"\[(?P<log_id>[0-9]+)\]" # log_id
+            r"\[(?P<time>[^\]]+)\]"  # time
+            r"\[(?P<log_id>[0-9]+)\]"  # log_id
             r"LogSquad: Player:"
-            r"(?P<victim>.*)" # victim
+            r"(?P<victim>.*)"  # victim
             r" ActualDamage=.* from "
-            r"(?P<killer>.*)" # killer
+            r"(?P<killer>.*)"  # killer
             r" caused by "
-            r"BP_(?P<weapon>[^\_]*)\_", # weapon
+            r"BP_(?P<weapon>[^\_]*)\_",  # weapon
             line,
         )
 
         # remember damage
-        if actual_damage == None:
-            self.logger.debug(f"[DAMAGE] -")
+        if actual_damage is None:
+            self.logger.debug(f"-")
             return False
-        self.logger.debug(f"[DAMAGE] +")
+        self.logger.debug(f"+")
 
         self.recent_damages.append(actual_damage)
         # only track the last 20 damages
-        self.logger.debug(f"[DAMAGE] recent size {len(self.recent_damages)}")
+        self.logger.debug(f"recent size {len(self.recent_damages)}")
         if len(self.recent_damages) > 20:
             del self.recent_damages[0]
-        return True # matched
+        return True  # matched
 
     def _match_teamkill(self, line):
         '''Returns TK object if TK occurred, `None` otherwise.'''
-        self.logger.debug(f"[TEAMKILL] ?")
+        self.logger.debug(f"?")
 
         team_kill = re.search(
-            r"\[(?P<log_id>[0-9]+)\]" # log_id
+            r"\[(?P<log_id>[0-9]+)\]"  # log_id
             r"[^\n]*"
             r"LogSquadScorePoints:[^\n]*TeamKilled",
             line,
         )
 
         if team_kill == None:
-            self.logger.debug(f"[TEAMKILL] -")
+            self.logger.debug(f"-")
             return None
-        self.logger.debug(f"[TEAMKILL] +")
+        self.logger.debug(f"+")
 
         # delete duplicate info on log id wrap-around
         if int(team_kill.group("log_id")) + 500 < self.last_log_id:
-            self.logger.debug(f"[TEAMKILL] WRAP_AROUND")
+            self.logger.debug(f"WRAP_AROUND")
             self.seen_tks.clear()
         self.last_log_id = int(team_kill.group("log_id"))
 
         # check for duplicate
         if team_kill.group("log_id") in self.seen_tks:
-            self.logger.debug(f"[TEAMKILL] DUPLICATE")
+            self.logger.debug(f"DUPLICATE")
             return None
-        self.logger.debug(f"[TEAMKILL] NEW")
+        self.logger.debug(f"NEW")
 
         # match log IDs
         for dmg in self.recent_damages:
             if dmg.group("log_id") == team_kill.group("log_id"):
-                self.logger.debug(f"[TEAMKILL] MATCH FOUND")
+                self.logger.debug(f"MATCH FOUND")
                 time_str = dmg.group("time")
-                time_naive = datetime.strptime(time_str, "%Y.%m.%d-%H.%M.%S:%f")
+                time_naive = datetime.strptime(time_str,
+                                               "%Y.%m.%d-%H.%M.%S:%f")
                 # Timestamps are UTC
                 time_utc = timezone("UTC").localize(time_naive)
                 victim = dmg.group("victim")
@@ -207,48 +196,48 @@ class TKMonitor():
                 return tk
 
     def _match_admincam(self, line):
-        '''Returns `True` if line was admin cam usage,
-        `False` otherwise.'''
-        self.logger.debug(f"[ADMIN_CAM] ENTER ?")
+        """Returns `True` if line was admin cam usage,
+        `False` otherwise."""
+        self.logger.debug(f"ENTER ?")
 
         change = None
 
         # check for possess
         match = re.search(
-            r"\[(?P<time>[^\]]+)\]" # time
-            r"\[(?P<log_id>[0-9]+)\]" # log_id
+            r"\[(?P<time>[^\]]+)\]"  # time
+            r"\[(?P<log_id>[0-9]+)\]"  # log_id
             r"[^\n]*"
             r"ASQPlayerController::Possess"
             r"[^\n]*"
-            r"PC=(?P<user>.*) " # user
+            r"PC=(?P<user>.*) "  # user
             r"[^\n]*"
-            r"Pawn=CameraMan_C_" # admin cam
+            r"Pawn=CameraMan_C_"  # admin cam
             ,
             line,
         )
 
         if match != None:
-            self.logger.debug(f"[ADMIN_CAM] ENTER +")
+            self.logger.debug(f"ENTER +")
             change = "++++++++++++ ENTER"
             user = match.group("user")
             self.active_admin_cam_users.add(user)
         else:
-            self.logger.debug(f"[ADMIN_CAM] ENTER -")
-            self.logger.debug(f"[ADMIN_CAM] LEAVE ?")
+            self.logger.debug(f"ENTER -")
+            self.logger.debug(f"LEAVE ?")
             # check for unpossess
             match = re.search(
-                r"\[(?P<time>[^\]]+)\]" # time
-                r"\[(?P<log_id>[0-9]+)\]" # log_id
+                r"\[(?P<time>[^\]]+)\]"  # time
+                r"\[(?P<log_id>[0-9]+)\]"  # log_id
                 r"[^\n]*"
                 r"ASQPlayerController::UnPossess"
                 r"[^\n]*"
-                r"PC=(?P<user>.*)" # user
+                r"PC=(?P<user>.*)"  # user
                 ,
                 line,
             )
 
             if match != None:
-                self.logger.debug(f"[ADMIN_CAM] LEAVE +")
+                self.logger.debug(f"LEAVE +")
                 change = "--- POSSIBLE LEAVE"
                 user = match.group("user")
                 if user not in self.active_admin_cam_users:
@@ -256,12 +245,12 @@ class TKMonitor():
                     return False
                 else:
                     self.active_admin_cam_users.remove(user)
-            self.logger.debug(f"[ADMIN_CAM] LEAVE -")
+            self.logger.debug(f"LEAVE -")
 
         if change is None:
-            self.logger.debug(f"[ADMIN_CAM] -")
+            self.logger.debug(f"-")
             return False
-        self.logger.debug(f"[ADMIN_CAM] +")
+        self.logger.debug(f"+")
 
         time_str = match.group("time")
         time_naive = datetime.strptime(time_str, "%Y.%m.%d-%H.%M.%S:%f")
@@ -271,26 +260,25 @@ class TKMonitor():
         user = match.group("user")
         log_message = f"[{time_utc_str} UTC] {change}: {user}"
 
-        self.logger.debug(f"[ADMIN_CAM] Opening admincam log")
+        self.logger.debug(f"Opening admincam log")
         with open(self.admincam_log_filename, "a", encoding="UTF-8") as f:
-            self.logger.debug(f"[ADMIN_CAM] Writing admincam log")
+            self.logger.debug(f"Writing admincam log")
             f.write(log_message + "\n")
-            self.logger.debug(f"[ADMIN_CAM] Done writing to admincam log")
-        self.logger.debug(f"[ADMIN_CAM] Closed admincam log")
-        print(f"[ADMIN CAM][{self.basedir}]{log_message}")
+            self.logger.debug(f"Done writing to admincam log")
+        self.logger.debug(f"Closed admincam log")
+        self.logger.debug(f"[{self.basedir}]{log_message}")
 
         return True
 
-
     async def tk_follow(self):
-        self.logger.debug(f"[FOLLOW] START")
+        self.logger.debug(f"START")
         async for line in self._log_follow():
-            self.logger.debug(f"[FOLLOW] GOT_LINE")
+            self.logger.debug(f"GOT_LINE")
             tk = self.parse_line(line)
-            if tk != None:
-                self.logger.debug(f"[FOLLOW] TK+")
+            if tk is not None:
+                self.logger.debug(f"TK+")
                 yield tk
-            self.logger.debug(f"[FOLLOW] TK-")
+            self.logger.debug(f"TK-")
 
 
 async def run_tkm(server):
@@ -308,14 +296,14 @@ async def run_tkm(server):
 
 
 async def post_tk(server, teamkill):
-    '''Posts the Teamkill to Discord via the configured webhooks.
+    """Posts the Teamkill to Discord via the configured webhooks.
 
-    Current map and servername are obtained through SteamQuery.'''
+    Current map and servername are obtained through SteamQuery."""
 
     # Get map and name from SteamQuery
-    server_obj  = SteamQuery(server.host, server.qport)
+    server_obj = SteamQuery(server.host, server.qport)
     server_info = server_obj.query_game_server()
-    cur_map     = server_info["map"]
+    cur_map = server_info["map"]
     server_name = server_info["name"]
 
     # Create embed
@@ -357,15 +345,3 @@ async def main():
 
     for t in tasks:
         await t
-
-
-if __name__ == "__main__":
-    file_handler = RotatingFileHandler("main.log", mode='a',
-                                        maxBytes=1*1024*1024*1024, # 1GB
-                                        encoding="UTF-8", delay=0,
-                                        backupCount=2)
-    file_handler.setLevel(logging.DEBUG)
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setLevel(logging.INFO)
-    logging.basicConfig(level=logging.INFO, handlers=[file_handler, stream_handler])
-    asyncio.run(main())
