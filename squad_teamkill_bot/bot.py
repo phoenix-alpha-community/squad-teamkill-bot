@@ -19,6 +19,9 @@ from pytz import timezone
 from steam import SteamQuery
 
 
+logger = logging.Logger(__name__)
+
+
 class TKMonitor:
 
     def __init__(self, basedir):
@@ -339,6 +342,10 @@ async def post_tk(server, teamkill):
 
 
 async def main():
+    logger.info("TK tracker started. Following squad logs on:")
+    for server in config.servers:
+        logger.info(f"- {server.basedir}")
+    logger.info("--------------------------------------------")
     tasks = []
     for server in config.servers:
         tasks.append(asyncio.create_task(run_tkm(server)))
