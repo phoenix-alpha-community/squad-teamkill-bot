@@ -18,8 +18,7 @@ from discord import Webhook, AsyncWebhookAdapter
 from pytz import timezone
 from steam import SteamQuery
 
-
-logger = logging.Logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class TKMonitor:
